@@ -1,11 +1,14 @@
 import logging
+import os
+import time
 from random import randint
 
+import hexdump
 from unicorn import Uc, UC_ARCH_ARM, UC_MODE_ARM
 from unicorn.arm_const import UC_ARM_REG_SP, UC_ARM_REG_LR, UC_ARM_REG_R0
 
 from androidemu import config
-from androidemu.config import MEMORY_BASE, MEMORY_SIZE
+from androidemu.config import HOOK_MEMORY_BASE, HOOK_MEMORY_SIZE
 from androidemu.cpu.interrupt_handler import InterruptHandler
 from androidemu.cpu.syscall_handlers import SyscallHandlers
 from androidemu.cpu.syscall_hooks import SyscallHooks
@@ -17,13 +20,13 @@ from androidemu.java.java_classloader import JavaClassLoader
 from androidemu.java.java_vm import JavaVM
 from androidemu.native.hooks import NativeHooks
 from androidemu.native.memory import NativeMemory
+from androidemu.tracer import Tracer
 from androidemu.vfs.file_system import VirtualFileSystem
 
 logger = logging.getLogger(__name__)
 
 
 class Emulator:
-
     """
     :type mu Uc
     :type modules Modules
@@ -35,6 +38,9 @@ class Emulator:
 
         if vfp_inst_set:
             self._enable_vfp()
+
+        # Android
+        self.system_properties = {"libc.debug.malloc.options":""}
 
         # Stack.
         self.mu.mem_map(config.STACK_ADDR, config.STACK_SIZE)
@@ -56,16 +62,19 @@ class Emulator:
             self.vfs = None
 
         # Hooker
-        self.mu.mem_map(config.MEMORY_BASE, config.MEMORY_SIZE)
-        self.hooker = Hooker(self, config.MEMORY_BASE, config.MEMORY_SIZE)
+        self.mu.mem_map(config.HOOK_MEMORY_BASE, config.HOOK_MEMORY_SIZE)
+        self.hooker = Hooker(self, config.HOOK_MEMORY_BASE, config.HOOK_MEMORY_SIZE)
 
         # JavaVM
         self.java_classloader = JavaClassLoader()
-        self.java_vm = JavaVM(self.java_classloader, self.hooker)
+        self.java_vm = JavaVM(self, self.java_classloader, self.hooker)
 
         # Native
-        self.native_memory = NativeMemory(self.mu, config.MEMORY_DYN_BASE, config.MEMORY_DYN_SIZE, self.syscall_handler)
-        self.native_hooks = NativeHooks(self.native_memory, self.modules, self.hooker)
+        self.native_memory = NativeMemory(self.mu, config.HEAP_BASE, config.HEAP_SIZE, self.syscall_handler)
+        self.native_hooks = NativeHooks(self, self.native_memory, self.modules, self.hooker)
+
+        # Tracer
+        self.tracer = Tracer(self.mu, self.modules)
 
     # https://github.com/unicorn-engine/unicorn/blob/8c6cbe3f3cabed57b23b721c29f937dd5baafc90/tests/regress/arm_fp_vfp_disabled.py#L15
     def _enable_vfp(self):
@@ -99,8 +108,17 @@ class Emulator:
         finally:
             self.mu.mem_unmap(address, mem_size)
 
-    def load_library(self, filename):
-        return self.modules.load_module(filename)
+    def _call_init_array(self):
+        pass
+
+    def load_library(self, filename, do_init=True):
+        libmod = self.modules.load_module(filename)
+        if do_init:
+            logger.debug("Calling Init for: %s " % filename)
+            for fun_ptr in libmod.init_array:
+                logger.debug("Calling Init function: %x " % fun_ptr)
+                self.call_native(fun_ptr)
+        return libmod
 
     def call_symbol(self, module, symbol_name, *argv):
         symbol = module.find_symbol(symbol_name)
@@ -122,8 +140,9 @@ class Emulator:
 
         try:
             # Execute native call.
-            native_write_args(self.mu, *argv)
-            stop_pos = randint(MEMORY_BASE, MEMORY_BASE + MEMORY_SIZE) | 1
+
+            native_write_args(self, *argv)
+            stop_pos = randint(HOOK_MEMORY_BASE, HOOK_MEMORY_BASE + HOOK_MEMORY_SIZE) | 1
             self.mu.reg_write(UC_ARM_REG_LR, stop_pos)
             self.mu.emu_start(addr, stop_pos - 1)
 
@@ -140,3 +159,12 @@ class Emulator:
             # Clear locals if jni.
             if is_jni:
                 self.java_vm.jni_env.clear_locals()
+
+    def dump(self, out_dir):
+        os.makedirs(out_dir)
+
+        for begin, end, prot in [reg for reg in self.mu.mem_regions()]:
+            filename = "{:#010x}-{:#010x}.bin".format(begin, end)
+            pathname = os.path.join(out_dir, filename)
+            with open(pathname, "w") as f:
+                f.write(hexdump.hexdump(self.mu.mem_read(begin, end - begin), result='return'))
